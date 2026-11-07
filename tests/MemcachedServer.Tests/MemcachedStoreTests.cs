@@ -328,4 +328,102 @@ public class MemcachedStoreTests
         Assert.True(store.CurrentBytes >= 0);
         Assert.True(store.Count > 0);
     }
+
+    [Fact]
+    public async Task ConcurrentExpiry_UnderReadWriteLoad_PurgesEverythingAndSparesLiveKeys()
+    {
+        var stats = new CacheStats();
+        var store = new MemcachedStore(TimeProvider.System, stats, 64 * 1024 * 1024, 1024 * 1024);
+
+        // One permanent control key: expiry churn around it must never touch it.
+        store.Store(StorageKind.Set, "control", 0, 0, Bytes("forever"));
+
+        using var stop = new CancellationTokenSource();
+        // The background sweep, running while the load is in flight.
+        var sweep = Task.Run(() =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                store.RunMaintenance();
+                Thread.Sleep(10);
+            }
+        });
+
+        // Eight workers hammer short-lived keys across their expiry boundary:
+        // set with a 1-second TTL, read back, delete some, re-set others.
+        var workers = Enumerable.Range(0, 8).Select(worker => Task.Run(() =>
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(2);
+            var i = 0;
+            while (DateTime.UtcNow < deadline)
+            {
+                var key = $"exp-{worker}-{i % 16}";
+                store.Store(StorageKind.Set, key, 0, 1, Bytes("short-lived"));
+                store.Get(key);
+                if (i % 5 == 0)
+                    store.Delete(key);
+                i++;
+            }
+        })).ToArray();
+        await Task.WhenAll(workers);
+
+        // Let every TTL lapse, then sweep once more with no load in flight.
+        await Task.Delay(1200);
+        stop.Cancel();
+        await sweep;
+        store.RunMaintenance();
+
+        // Every churned key carried a TTL, so nothing of them may remain —
+        // not as a countable entry and not as a single leaked byte.
+        Assert.Equal(1, store.Count);
+        Assert.True(store.Get("control").Found);
+        Assert.Equal(7 + 7, store.CurrentBytes); // "control" (7) + "forever" (7)
+    }
+
+    [Fact]
+    public async Task ConcurrentEviction_UnderWritePressure_KeepsTheByteLedgerExact()
+    {
+        var stats = new CacheStats();
+        const long limit = 8 * 1024;
+        var store = new MemcachedStore(TimeProvider.System, stats, limit, 1024 * 1024);
+        var value = Bytes(new string('v', 512));
+
+        const int workers = 8;
+        const int setsPerWorker = 300;
+        var tasks = Enumerable.Range(0, workers).Select(worker => Task.Run(() =>
+        {
+            for (var i = 0; i < setsPerWorker; i++)
+            {
+                var key = $"w{worker}-{i}";
+                store.Store(StorageKind.Set, key, 0, 0, value);
+                store.Get(key);
+            }
+        })).ToArray();
+        await Task.WhenAll(tasks);
+
+        // The pressure must actually have forced evictions.
+        Assert.True(stats.Evictions > 0);
+        Assert.True(store.CurrentBytes <= limit);
+
+        // The ledger must be exact: the bytes the store reports are precisely
+        // the key+value cost of the entries that survived, no more, no less.
+        long expectedBytes = 0;
+        var survivors = 0;
+        for (var w = 0; w < workers; w++)
+        {
+            for (var i = 0; i < setsPerWorker; i++)
+            {
+                var key = $"w{w}-{i}";
+                var outcome = store.Get(key);
+                if (outcome.Found)
+                {
+                    survivors++;
+                    expectedBytes += key.Length + outcome.Value.Length;
+                }
+            }
+        }
+        Assert.True(survivors > 0);
+        Assert.Equal(survivors, store.Count);
+        Assert.Equal(expectedBytes, store.CurrentBytes);
+    }
 }
